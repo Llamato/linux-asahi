@@ -26,9 +26,10 @@ use crate::{
     mem, //
 };
 use kernel::{
+    bindings,
     c_str,
     prelude::*,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{
         delay::fsleep,
         Delta,
@@ -584,11 +585,113 @@ impl KTraceChannel {
 }
 
 /// Statistics channel, reporting power-related statistics to the driver.
-/// Not really implemented other than debug logs yet...
 #[versions(AGX)]
 pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
+    stats: Arc<Mutex<StatsState>>,
+}
+
+/// Accumulated GPU statistics, reported to userspace by `DRM_IOCTL_ASAHI_GET_STATS`.
+///
+/// The driver counts the submissions it has in flight, which is the only utilisation signal it has
+/// without firmware support: time with submissions in flight is accounted as busy, the rest as
+/// idle.
+#[derive(Default)]
+pub(crate) struct StatsState {
+    /// Number of submissions in flight.
+    ops: u32,
+    /// Last time the counters below were advanced.
+    last_tick: Option<Instant<Monotonic>>,
+    /// Nanoseconds with submissions in flight / idle since the driver was initialised.
+    busy_ns: u64,
+    idle_ns: u64,
+    /// Nanoseconds with submissions in flight / idle since the last snapshot.
+    window_busy_ns: u64,
+    window_idle_ns: u64,
+    /// Latest performance state reported by the firmware, if any.
+    pstate: Option<u32>,
+}
+
+impl StatsState {
+    /// Advance the busy/idle counters up to `now`.
+    fn tick(&mut self, now: Instant<Monotonic>) {
+        if let Some(last) = self.last_tick {
+            let delta = now - last;
+            if !delta.is_negative() {
+                let delta = delta.as_nanos() as u64;
+                if self.ops > 0 {
+                    self.busy_ns += delta;
+                    self.window_busy_ns += delta;
+                } else {
+                    self.idle_ns += delta;
+                    self.window_idle_ns += delta;
+                }
+            }
+        }
+
+        self.last_tick = Some(now);
+    }
+
+    /// Account for a submission that started.
+    pub(crate) fn op_start(&mut self) {
+        let now = Instant::<Monotonic>::now();
+        self.tick(now);
+        self.ops = self.ops.saturating_add(1);
+    }
+
+    /// Account for a submission that completed.
+    pub(crate) fn op_end(&mut self) {
+        let now = Instant::<Monotonic>::now();
+        self.tick(now);
+        self.ops = self.ops.saturating_sub(1);
+    }
+
+    /// Update the state from a performance state reported by the firmware.
+    pub(crate) fn report_pstate(&mut self, pstate: u32) {
+        self.pstate = Some(pstate);
+    }
+
+    /// Take a snapshot of the statistics, which starts a new measurement window.
+    pub(crate) fn snapshot(&mut self) -> StatsSnapshot {
+        let now = Instant::<Monotonic>::now();
+        self.tick(now);
+
+        let window_busy = core::mem::take(&mut self.window_busy_ns);
+        let window_idle = core::mem::take(&mut self.window_idle_ns);
+        let window = window_busy + window_idle;
+
+        StatsSnapshot {
+            // SAFETY: `ktime_get()` just reads the monotonic clock.
+            timestamp_ns: (unsafe { bindings::ktime_get() }) as u64,
+            busy_percent: (window > 0).then(|| {
+                // window * 100 would overflow for a window of over ~58 years of nanoseconds,
+                // which happens if the ioctl is never called. Scale such a window down first,
+                // 128-bit division is not available to modules.
+                let (busy, total) = if window > u64::MAX / 100 {
+                    (window_busy / 1024, window / 1024)
+                } else {
+                    (window_busy, window)
+                };
+
+                ((busy * 100) / total) as u32
+            }),
+            busy_ns: self.busy_ns,
+            idle_ns: self.idle_ns,
+            pstate: self.pstate,
+            frequency_khz: None,
+        }
+    }
+}
+
+/// Snapshot of `StatsState`, see `drm_asahi_get_stats`.
+pub(crate) struct StatsSnapshot {
+    pub(crate) timestamp_ns: u64,
+    pub(crate) busy_percent: Option<u32>,
+    pub(crate) busy_ns: u64,
+    pub(crate) idle_ns: u64,
+    pub(crate) pstate: Option<u32>,
+    pub(crate) frequency_khz: Option<u32>,
 }
 
 #[versions(AGX)]
@@ -597,10 +700,12 @@ impl StatsChannel::ver {
     pub(crate) fn new(
         dev: &AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
+        stats: Arc<Mutex<StatsState>>,
     ) -> Result<StatsChannel::ver> {
         Ok(StatsChannel::ver {
             dev: dev.into(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
+            stats,
         })
     }
 
@@ -620,6 +725,13 @@ impl StatsChannel::ver {
                     // accessing the enum view is valid.
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
+
+                    // TODO: Only the performance state is reported for now. The power,
+                    // temperature and utilisation messages are debug-logged above, but their units
+                    // and semantics are not understood well enough to report them yet.
+                    if let StatsMsg::ver::PowerState { pstate, .. } = msg {
+                        self.stats.lock().report_pstate(pstate)
+                    }
                 }
                 _ => {
                     // SAFETY: The raw view is always valid for all bit patterns.

@@ -257,6 +257,8 @@ pub(crate) struct GpuManager {
     event_manager: Arc<event::EventManager>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
+    /// GPU statistics, shared with the firmware stats channel.
+    stats: Arc<Mutex<channel::StatsState>>,
     #[allow(clippy::vec_box)]
     #[pin]
     garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
@@ -320,6 +322,10 @@ pub(crate) trait GpuManager: Send + Sync {
     fn get_cfg(&self) -> &'static hw::HwConfig;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
+    /// Take a snapshot of the GPU statistics, see `drm_asahi_get_stats`.
+    ///
+    /// This also restarts the utilisation measurement window.
+    fn stats_snapshot(&self) -> channel::StatsSnapshot;
     /// Register an unused context as garbage
     fn free_context(&self, data: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>);
     /// Check whether the GPU is crashed
@@ -728,6 +734,8 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
+        let stats = Arc::pin_init(new_mutex!(channel::StatsState::default(), "stats"), GFP_KERNEL)?;
+        let stats_rx = stats.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -739,7 +747,7 @@ impl GpuManager::ver {
                 )?,
                 fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
                 ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(dev, alloc_ref)?,
+                stats: channel::StatsChannel::ver::new(dev, alloc_ref, stats_rx)?,
             }),
             GFP_KERNEL,
         )?;
@@ -771,6 +779,7 @@ impl GpuManager::ver {
                 pipes,
                 buffer_mgr,
                 ids: Default::default(),
+                stats,
                 garbage_contexts <- new_mutex!(KVec::new(), "garbage_contexts"),
             }),
             GFP_KERNEL,
@@ -1140,6 +1149,7 @@ impl GpuManager::ver {
 
         mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
         self.kick_firmware()?;
+        self.stats.lock().op_start();
         Ok(OpGuard(self.clone()))
     }
 
@@ -1598,6 +1608,20 @@ impl GpuManager for GpuManager::ver {
         &self.dyncfg
     }
 
+    fn stats_snapshot(&self) -> channel::StatsSnapshot {
+        let mut snapshot = self.stats.lock().snapshot();
+
+        // The firmware reports a performance state index, map it to a clock rate using the
+        // operating points read from the device tree.
+        if let Some(pstate) = snapshot.pstate {
+            if let Some(state) = self.dyncfg.pwr.perf_states.get(pstate as usize) {
+                snapshot.frequency_khz = Some(state.freq_hz / 1000);
+            }
+        }
+
+        snapshot
+    }
+
     fn free_context(&self, ctx: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>) {
         let mut garbage = self.garbage_contexts.lock();
 
@@ -1638,5 +1662,7 @@ impl GpuManagerPriv for GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
 
         mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+
+        self.stats.lock().op_end();
     }
 }

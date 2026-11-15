@@ -93,6 +93,9 @@ enum drm_asahi_ioctl_id {
 
 	/** @DRM_ASAHI_SUBMIT: Submit commands to a queue. */
 	DRM_ASAHI_SUBMIT,
+
+	/** @DRM_ASAHI_GET_STATS: Query GPU utilisation and power state statistics. */
+	DRM_ASAHI_GET_STATS,
 };
 
 #define DRM_ASAHI_MAX_CLUSTERS	64
@@ -1158,6 +1161,84 @@ struct drm_asahi_get_time {
 };
 
 /**
+ * define DRM_ASAHI_STAT_BUSY - &drm_asahi_get_stats.busy_percent is valid.
+ */
+#define DRM_ASAHI_STAT_BUSY	(1 << 0)
+
+/**
+ * define DRM_ASAHI_STAT_PSTATE - &drm_asahi_get_stats.pstate is valid.
+ */
+#define DRM_ASAHI_STAT_PSTATE	(1 << 1)
+
+/**
+ * define DRM_ASAHI_STAT_FREQ - &drm_asahi_get_stats.frequency_khz is valid.
+ */
+#define DRM_ASAHI_STAT_FREQ	(1 << 2)
+
+/**
+ * define DRM_ASAHI_STAT_POWER - &drm_asahi_get_stats.power_uw is valid.
+ */
+#define DRM_ASAHI_STAT_POWER	(1 << 3)
+
+/**
+ * define DRM_ASAHI_STAT_TEMP - &drm_asahi_get_stats.temp_mcelsius is valid.
+ */
+#define DRM_ASAHI_STAT_TEMP	(1 << 4)
+
+/**
+ * struct drm_asahi_get_stats - Arguments passed to DRM_IOCTL_ASAHI_GET_STATS
+ *
+ * Only the fields flagged in @valid by the driver carry data, all other fields
+ * are left untouched. A driver that does not implement this ioctl fails it with
+ * EINVAL, like any unknown Asahi ioctl.
+ *
+ * The counters are sampled: @busy_percent describes the fraction of the time
+ * the driver had work in flight since the previous DRM_IOCTL_ASAHI_GET_STATS
+ * call on this device (the measurement window is shared by all clients, so a
+ * client only sees the window since the last call from any client), while
+ * @gpu_busy_ns and @gpu_idle_ns are totals since the driver was initialised and
+ * can be used to build windows of any length. The remaining fields are
+ * point-in-time values.
+ */
+struct drm_asahi_get_stats {
+	/** @flags: MBZ. */
+	__u64 flags;
+
+	/**
+	 * @timestamp_ns: On return, driver monotonic time (CLOCK_MONOTONIC) of
+	 * the sample, in nanoseconds.
+	 */
+	__u64 timestamp_ns;
+
+	/** @valid: Bitmask of DRM_ASAHI_STAT_xxx. */
+	__u32 valid;
+
+	/** @busy_percent: Utilisation of the last window, in percent (0-100). */
+	__u32 busy_percent;
+
+	/** @gpu_busy_ns: Nanoseconds with GPU work in flight since init. */
+	__u64 gpu_busy_ns;
+
+	/** @gpu_idle_ns: Nanoseconds without GPU work in flight since init. */
+	__u64 gpu_idle_ns;
+
+	/** @pstate: Current GPU performance state index. */
+	__u32 pstate;
+
+	/** @frequency_khz: GPU core clock of @pstate, in kilohertz. */
+	__u32 frequency_khz;
+
+	/** @power_uw: GPU power consumption in microwatts. */
+	__u64 power_uw;
+
+	/** @temp_mcelsius: GPU temperature in milli-degrees Celsius. */
+	__s32 temp_mcelsius;
+
+	/** @pad: MBZ. */
+	__u32 pad;
+};
+
+/**
  * DRM_IOCTL_ASAHI() - Build an Asahi IOCTL number
  * @__access: Access type. Must be R, W or RW.
  * @__id: One of the DRM_ASAHI_xxx id.
@@ -1185,6 +1266,7 @@ enum {
 	DRM_IOCTL_ASAHI_QUEUE_CREATE     = DRM_IOCTL_ASAHI(WR, QUEUE_CREATE, queue_create),
 	DRM_IOCTL_ASAHI_QUEUE_DESTROY    = DRM_IOCTL_ASAHI(W, QUEUE_DESTROY, queue_destroy),
 	DRM_IOCTL_ASAHI_SUBMIT           = DRM_IOCTL_ASAHI(W, SUBMIT, submit),
+	DRM_IOCTL_ASAHI_GET_STATS        = DRM_IOCTL_ASAHI(WR, GET_STATS, get_stats),
 };
 
 #if defined(__cplusplus)

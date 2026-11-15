@@ -104,6 +104,8 @@ impl drm::driver::Driver for AsahiDriver {
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::queue_destroy),
         (ASAHI_SUBMIT,          drm_asahi_submit,
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::submit),
+        (ASAHI_GET_STATS,       drm_asahi_get_stats,
+                          ioctl::RENDER_ALLOW, crate::file::File::get_stats),
     }
 }
 

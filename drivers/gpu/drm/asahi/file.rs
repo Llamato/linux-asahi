@@ -1085,6 +1085,48 @@ impl File {
 
         Ok(0)
     }
+
+    /// IOCTL: get_stats: Get GPU utilisation, clock and power state statistics.
+    pub(crate) fn get_stats(
+        device: &AsahiDevice,
+        data: &mut uapi::drm_asahi_get_stats,
+        _file: &DrmFile,
+    ) -> Result<u32> {
+        if data.flags != 0 {
+            cls_pr_debug!(Errors, "get_stats: Unexpected flags\n");
+            return Err(EINVAL);
+        }
+
+        let snapshot = device.gpu.stats_snapshot();
+        let mut stats = uapi::drm_asahi_get_stats {
+            timestamp_ns: snapshot.timestamp_ns,
+            gpu_busy_ns: snapshot.busy_ns,
+            gpu_idle_ns: snapshot.idle_ns,
+            ..Default::default()
+        };
+
+        if let Some(busy_percent) = snapshot.busy_percent {
+            stats.valid |= uapi::DRM_ASAHI_STAT_BUSY;
+            stats.busy_percent = busy_percent;
+        }
+
+        if let Some(pstate) = snapshot.pstate {
+            stats.valid |= uapi::DRM_ASAHI_STAT_PSTATE;
+            stats.pstate = pstate;
+        }
+
+        if let Some(frequency_khz) = snapshot.frequency_khz {
+            stats.valid |= uapi::DRM_ASAHI_STAT_FREQ;
+            stats.frequency_khz = frequency_khz;
+        }
+
+        // TODO: @power_uw and @temp_mcelsius are left invalid: the firmware reports power and
+        // temperature on the stats channel, but not in a unit we can trust yet.
+
+        *data = stats;
+
+        Ok(0)
+    }
 }
 
 impl Drop for File {
